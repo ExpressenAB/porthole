@@ -176,6 +176,8 @@ func serveRoot(w http.ResponseWriter, r *http.Request) {
 func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 	log.Printf("New client connected: %s", r.RemoteAddr)
 	log.Printf("%s", context.Get(r, "claims"))
+	c := context.Get(r, "claims").(PortholeClaims)
+	log.Printf("Claims: %v", c)
 	// Setup ws
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -200,16 +202,22 @@ func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 		internalError(ws, "docker", err)
 		return
 	}
-	ret, err := runDockerExec(ws, client, inr, outw)
 
 	stdoutDone := make(chan struct{})
 	go pumpStdout(ws, outr, stdoutDone)
 	go ping(ws, stdoutDone)
 	// maybe docker exec should be blockinh here, not pumpStdin.
-	pumpStdin(ws, inw)
+	go pumpStdin(ws, inw)
+	execObj, err := runDockerExec(ws, client, inr, outw, c.Cmd, c.Tty)
+	if err != nil {
+		log.Printf("docker error: %s", err.Error())
+		inw.Close()
+		inr.Close()
+		ws.Close()
+		return
+	}
 	inw.Close()
 	inr.Close()
-	execObj := <-ret
 	select {
 	case <-stdoutDone:
 	case <-time.After(time.Second):
@@ -239,6 +247,7 @@ func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 		}
 		<-stdoutDone
 	}
+	ws.Close()
 }
 
 func pumpStdout(ws *websocket.Conn, r io.Reader, done chan struct{}) {
@@ -273,6 +282,7 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 		log.Printf("stdin: message: %s", message)
 		if err != nil {
 			log.Printf("error: %s", err.Error())
+			ws.Close()
 			break
 		}
 		message = append(message, '\n')

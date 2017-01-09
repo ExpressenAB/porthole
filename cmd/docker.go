@@ -8,42 +8,37 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func runDockerExec(ws *websocket.Conn, client *docker.Client, r io.Reader, w io.Writer) (<-chan *docker.Exec, error) {
+func runDockerExec(ws *websocket.Conn, client *docker.Client, r io.Reader, w io.Writer, command []string, tty bool) (*docker.Exec, error) {
 	// Setup command
-	cmd := "/bin/sh"
-	containerId := "32a0be471ae3"
+
+	//cmd := "/bin/bash"
+	containerId := "6d90028013a3"
 	execConfig := docker.CreateExecOptions{
 		Container:    containerId,
 		AttachStdin:  true,
 		AttachStdout: true,
-		Tty:          true,
-		Cmd:          []string{cmd},
+		Tty:          tty,
+		Cmd:          command,
 	}
 	execObj, err := client.CreateExec(execConfig)
-	ret := make(chan *docker.Exec)
 	if err != nil {
 		log.Printf("Error creating Exec: %s\n", err.Error())
 		internalError(ws, "docker", err)
 		return nil, err
 	}
-	success := make(chan struct{})
+	//success := make(chan struct{})
 	startConfig := docker.StartExecOptions{
 		OutputStream: w,
 		ErrorStream:  w,
 		InputStream:  r,
 		RawTerminal:  true,
 		Tty:          true,
-		Success:      success,
+		//Success:      success,
 	}
-	errch := make(chan error, 1)
-	go func() {
-		if err := client.StartExec(execObj.ID, startConfig); err != nil {
-			log.Printf("Error in docker exec: %s\n", err.Error())
-			errch <- err
-		}
-		ret <- execObj
-	}()
-	<-success
-	close(success)
-	return ret, nil
+	log.Println("Starting docker exec")
+	if err := client.StartExec(execObj.ID, startConfig); err != nil {
+		log.Printf("Error in docker exec: %s\n", err.Error())
+		return nil, err
+	}
+	return execObj, nil
 }
