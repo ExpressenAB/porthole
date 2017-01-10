@@ -32,26 +32,14 @@ import (
 	"github.com/gorilla/websocket"
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/justinas/alice" // chained middleware
-	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
+	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
 var (
-	addr       string
-	useTls     bool
-	tlsCert    string
-	tlsKey     string
-	auth       string
-	pskFile    string
-	vaultAddr  string
-	vaultToken string
-	vaultPath  string
-
 	upgrader = websocket.Upgrader{
-		CheckOrigin:     func(r *http.Request) bool { return true },
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	vaultConfig = vaultapi.DefaultConfig()
 	pskList     = viper.New()
@@ -63,7 +51,7 @@ const (
 	// Maximum message size allowed from peer.
 	maxMessageSize = 8192
 	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
+	pongWait = 10 * time.Second
 	// Send pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
 	// Time to wait before force close on connection.
@@ -72,8 +60,9 @@ const (
 	portholePath = "/exec"
 )
 
+// PortholeClaims : this is our expected claims
 type PortholeClaims struct {
-	ContainerId string   `json:"containerId"`
+	ContainerID string   `json:"containerID"`
 	Cmd         []string `json:"cmd"`
 	Tty         bool     `json:"tty"`
 	jwt.StandardClaims
@@ -93,20 +82,52 @@ that´s it!`,
 
 func init() {
 	RootCmd.AddCommand(serveCmd)
-	serveCmd.PersistentFlags().StringVar(&addr, "addr", "127.0.0.1:8888", "porthole listen address")
-	serveCmd.PersistentFlags().BoolVar(&useTls, "tls", true, "Enable tls")
-	serveCmd.PersistentFlags().StringVar(&tlsCert, "tls-cert", "${HOME}/porthole.crt", "path to porthole tls certificate")
-	serveCmd.PersistentFlags().StringVar(&tlsKey, "tls-key", "${HOME}/porthole.key", "path to porthole tls key")
-	serveCmd.PersistentFlags().StringVar(&auth, "auth", "psk", "jwt auth provider, must be one of (hmac/vault)")
-	serveCmd.PersistentFlags().StringVar(&pskFile, "psk-file", "${HOME}/porthole-psk", "yaml file of psk: [<accesskeys>:<secretkeys>]")
-	serveCmd.PersistentFlags().StringVar(&vaultAddr, "vault-addr", "http://127.0.0.1:8200", "vault address")
-	serveCmd.PersistentFlags().StringVar(&vaultToken, "vault-token", "myroot", "vault token")
-	serveCmd.PersistentFlags().StringVar(&vaultPath, "vault-path", "porthole", "vault path, will be appended to /transit/hmac/")
+	serveCmd.PersistentFlags().String("addr", "127.0.0.1:8888", "porthole listen address")
+	serveCmd.PersistentFlags().Bool("tls", true, "Enable tls")
+	serveCmd.PersistentFlags().String("tls-cert", "${HOME}/porthole.crt", "path to porthole tls certificate")
+	serveCmd.PersistentFlags().String("tls-key", "${HOME}/porthole.key", "path to porthole tls key")
+	serveCmd.PersistentFlags().String("auth", "hs256", "jwt auth provider, must be one of (hs256/vault)")
+	serveCmd.PersistentFlags().String("psk-file", "${HOME}/.porthole-psk", "yaml file of psk: [<username>:<secretkey>]")
+	serveCmd.PersistentFlags().String("vault-addr", "http://127.0.0.1:8200", "vault address")
+	serveCmd.PersistentFlags().String("vault-token", "myroot", "vault token")
+	serveCmd.PersistentFlags().String("vault-path", "porthole", "vault path, will be appended to /transit/hmac/")
 	viper.SetEnvPrefix("porthole")
-	//viper.BindPFlag("addr2", serveCmd.Flags().Lookup("addr2"))
-	//viper.BindEnv("addr2")
-	pskList.SetConfigName("psk-file")
-	pskList.AddConfigPath(pskFile)
+	bindFlags()
+	bindEnvs()
+	if strings.ToLower(viper.GetString("auth")) == "hs256" {
+		if pskFile != "" {
+			pskList.SetConfigFile(pskFile)
+		}
+		pskList.SetConfigName(".porthole-psk")
+		pskList.AddConfigPath("$HOME")
+		pskList.AddConfigPath(".")
+		err := pskList.ReadInConfig()
+		if err != nil {
+			log.Fatalf("Error reading psk-file: %s", err.Error())
+		}
+	}
+
+}
+
+func bindFlags() {
+	serveCmd.PersistentFlags().VisitAll(func(f *flag.Flag) {
+		err := viper.BindPFlag(f.Name, f)
+		if err != nil {
+			log.Fatalf("Error setting up flags: %s", err.Error())
+		}
+	})
+}
+
+func bindEnvs() {
+	viper.SetEnvPrefix("porthole")
+	replacer := strings.NewReplacer(".", "_")
+	viper.SetEnvKeyReplacer(replacer)
+	serveCmd.PersistentFlags().VisitAll(func(f *flag.Flag) {
+		err := viper.BindEnv(f.Name)
+		if err != nil {
+			log.Fatalf("Error setting up environment variables: %s", err.Error())
+		}
+	})
 }
 
 func serve(cmd *cobra.Command, args []string) {
@@ -114,8 +135,8 @@ func serve(cmd *cobra.Command, args []string) {
 
 	http.HandleFunc("/", serveRoot)
 	http.Handle(portholePath, chain.ThenFunc(servePortholeWs))
-
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Printf("Starting porthole with %s auth, listening on %s", viper.GetString("auth"), viper.GetString("addr"))
+	log.Fatal(http.ListenAndServe(viper.GetString("addr"), nil))
 }
 
 func internalError(ws *websocket.Conn, msg string, err error) {
@@ -125,38 +146,43 @@ func internalError(ws *websocket.Conn, msg string, err error) {
 
 func jwtMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		vaultConfig.Address = vaultAddr
+		vaultConfig.Address = viper.GetString("vault-addr")
 		config := vault_jwt.Config{
 			vaultConfig,
-			vaultPath,
-			vaultToken,
+			viper.GetString("vault-path"),
+			viper.GetString("vault-token"),
 			false,
 		}
-		token, err := jwtRequest.ParseFromRequest(r, jwtRequest.AuthorizationHeaderExtractor, func(token *jwt.Token) (interface{}, error) {
-			if ok := strings.ToLower(token.Method.Alg()) == strings.ToLower(auth); !ok {
+		token, err := jwtRequest.ParseFromRequestWithClaims(r, jwtRequest.AuthorizationHeaderExtractor, &PortholeClaims{}, func(token *jwt.Token) (interface{}, error) {
+			// check that Alg is what we expect
+			if ok := strings.ToLower(token.Method.Alg()) == strings.ToLower(viper.GetString("auth")); !ok {
 				log.Printf("Got alg: %s", token.Method.Alg())
 				return nil, errors.New("unexpected signing alg")
 			}
-			if ok := token.Claims.(jwt.MapClaims)["sub"] != nil; !ok {
+			log.Printf("Got alg: %s", token.Method.Alg())
+			if ok := token.Claims.(*PortholeClaims).Subject != ""; !ok {
 				log.Println("Missing subject in claim")
 				return nil, errors.New("missing subject in claim")
 			}
-			return config, nil
+			if strings.ToLower(token.Method.Alg()) == "vault" {
+				return config, nil
+			} else if strings.ToLower(token.Method.Alg()) == "hs256" {
+				return []byte(pskList.GetString(token.Claims.(*PortholeClaims).Subject)), nil
+			} else {
+				return nil, errors.New("jwt key function failed")
+			}
 		})
+
 		if err != nil {
-			log.Printf("jwt error: %s", err.Error())
+			log.Printf("jwt error parse: %s", err.Error())
 			http.Error(w, "Not authorized", 401)
 			return
 		}
-		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-			var pc PortholeClaims
-			if err := mapstructure.Decode(claims, &pc); err != nil {
-				log.Printf("decode error: %s", err.Error())
-				http.Error(w, "Not authorized", 401)
-				return
-			}
-			log.Printf("Claims: %v", pc)
-			context.Set(r, "claims", pc)
+
+		if claims, ok := token.Claims.(*PortholeClaims); ok && token.Valid {
+			log.Printf("Claims: %v", claims)
+			// check that claims are what expected
+			context.Set(r, "claims", claims)
 		} else {
 			log.Printf("jwt error: %s", err.Error())
 			http.Error(w, "Not authorized", 401)
@@ -176,7 +202,7 @@ func serveRoot(w http.ResponseWriter, r *http.Request) {
 func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 	log.Printf("New client connected: %s", r.RemoteAddr)
 	log.Printf("%s", context.Get(r, "claims"))
-	c := context.Get(r, "claims").(PortholeClaims)
+	c := context.Get(r, "claims").(*PortholeClaims)
 	log.Printf("Claims: %v", c)
 	// Setup ws
 	ws, err := upgrader.Upgrade(w, r, nil)
@@ -195,8 +221,7 @@ func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 	defer inw.Close()
 
 	// Run docker exec
-	endpoint := "unix:///var/run/docker.sock"
-	client, err := docker.NewClient(endpoint)
+	client, err := docker.NewClientFromEnv()
 	if err != nil {
 		log.Printf("Error creating docker client: %s\n", err.Error())
 		internalError(ws, "docker", err)
@@ -204,49 +229,56 @@ func servePortholeWs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stdoutDone := make(chan struct{})
+	stdinDone := make(chan struct{})
+	dockerDone := make(chan struct{})
 	go pumpStdout(ws, outr, stdoutDone)
-	go ping(ws, stdoutDone)
+	go ping(ws, stdoutDone, stdinDone)
 	// maybe docker exec should be blockinh here, not pumpStdin.
-	go pumpStdin(ws, inw)
-	execObj, err := runDockerExec(ws, client, inr, outw, c.Cmd, c.Tty)
+	//go pumpStdin(ws, inw, stdinDone)
+	execObj, err := runDockerExec(client, c.ContainerID, inr, outw, c.Cmd, c.Tty, dockerDone)
 	if err != nil {
 		log.Printf("docker error: %s", err.Error())
-		inw.Close()
-		inr.Close()
-		ws.Close()
 		return
 	}
-	inw.Close()
-	inr.Close()
+	log.Printf("ExecID: %s", execObj.ID)
+	//inw.Close()
+	//inr.Close()
+	go pumpStdin(ws, inw, stdinDone)
+	close(dockerDone)
 	select {
 	case <-stdoutDone:
-	case <-time.After(time.Second):
-		log.Println("stdout closed")
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		count := 0
-		for {
-			inspect, err2 := client.InspectExec(execObj.ID)
-			if err2 != nil {
-				return
-			}
-			if !inspect.Running {
-				if inspect.ExitCode != 0 {
-					log.Printf("container not running\n")
-				}
-				break
-			}
+		log.Println("stdout done")
+	case <-stdinDone:
+		inw.Write([]byte("exit\n"))
+		log.Println("stdin done")
+		// case <-time.After(time.Second):
+		// 	log.Println("stdout closed")
+		// 	ticker := time.NewTicker(2 * time.Second)
+		// 	defer ticker.Stop()
+		// 	count := 0
+		// 	for {
+		// 		inspect, err2 := client.InspectExec(execObj.ID)
+		// 		if err2 != nil {
+		// 			return
+		// 		}
+		// 		if !inspect.Running {
+		// 			if inspect.ExitCode != 0 {
+		// 				log.Printf("container not running\n")
+		// 			}
+		// 			break
+		// 		}
 
-			count++
-			if count == 5 {
-				log.Printf("Exec session %s in container terminated but process still running!\n", execObj.ID)
-				break
-			}
+		// 		count++
+		// 		if count == 5 {
+		// 			log.Printf("Exec session %s in container terminated but process still running!\n", execObj.ID)
+		// 			break
+		// 		}
 
-			<-ticker.C
-		}
-		<-stdoutDone
+		// 		<-ticker.C
+		// 	}
+		// 	<-stdoutDone
 	}
+	log.Printf("Client left: %s", r.RemoteAddr)
 	ws.Close()
 }
 
@@ -257,13 +289,14 @@ func pumpStdout(ws *websocket.Conn, r io.Reader, done chan struct{}) {
 	for s.Scan() {
 		ws.SetWriteDeadline(time.Now().Add(writeWait))
 		if err := ws.WriteMessage(websocket.TextMessage, s.Bytes()); err != nil {
-			ws.Close()
+			log.Println("Error writing message:", err)
 			break
 		}
 	}
 	if s.Err() != nil {
 		log.Println("scan:", s.Err())
 	}
+	log.Println("Closing stdout")
 	close(done)
 
 	ws.SetWriteDeadline(time.Now().Add(writeWait))
@@ -272,8 +305,8 @@ func pumpStdout(ws *websocket.Conn, r io.Reader, done chan struct{}) {
 	ws.Close()
 }
 
-func pumpStdin(ws *websocket.Conn, w io.Writer) {
-	defer ws.Close()
+func pumpStdin(ws *websocket.Conn, w io.Writer, done chan struct{}) {
+	//defer ws.Close()
 	ws.SetReadLimit(maxMessageSize)
 	ws.SetReadDeadline(time.Now().Add(pongWait))
 	ws.SetPongHandler(func(string) error { ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
@@ -282,7 +315,6 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 		log.Printf("stdin: message: %s", message)
 		if err != nil {
 			log.Printf("error: %s", err.Error())
-			ws.Close()
 			break
 		}
 		message = append(message, '\n')
@@ -290,18 +322,23 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 			break
 		}
 	}
+	close(done)
+	ws.Close()
 }
 
-func ping(ws *websocket.Conn, done chan struct{}) {
+func ping(ws *websocket.Conn, stdoutDone chan struct{}, stdinDone chan struct{}) {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-				log.Println("ping:", err)
+				log.Println("ping failed, closing connection:", err)
+				break
 			}
-		case <-done:
+		case <-stdoutDone:
+			return
+		case <-stdinDone:
 			return
 		}
 	}

@@ -5,16 +5,15 @@ import (
 	"log"
 
 	"github.com/fsouza/go-dockerclient"
-	"github.com/gorilla/websocket"
 )
 
-func runDockerExec(ws *websocket.Conn, client *docker.Client, r io.Reader, w io.Writer, command []string, tty bool) (*docker.Exec, error) {
+func runDockerExec(client *docker.Client, c string, r io.Reader, w io.Writer, command []string, tty bool, success chan struct{}) (*docker.Exec, error) {
 	// Setup command
 
 	//cmd := "/bin/bash"
-	containerId := "6d90028013a3"
+	containerID := c
 	execConfig := docker.CreateExecOptions{
-		Container:    containerId,
+		Container:    containerID,
 		AttachStdin:  true,
 		AttachStdout: true,
 		Tty:          tty,
@@ -23,7 +22,6 @@ func runDockerExec(ws *websocket.Conn, client *docker.Client, r io.Reader, w io.
 	execObj, err := client.CreateExec(execConfig)
 	if err != nil {
 		log.Printf("Error creating Exec: %s\n", err.Error())
-		internalError(ws, "docker", err)
 		return nil, err
 	}
 	//success := make(chan struct{})
@@ -31,14 +29,20 @@ func runDockerExec(ws *websocket.Conn, client *docker.Client, r io.Reader, w io.
 		OutputStream: w,
 		ErrorStream:  w,
 		InputStream:  r,
-		RawTerminal:  true,
-		Tty:          true,
+		RawTerminal:  tty,
+		Tty:          tty,
 		//Success:      success,
 	}
 	log.Println("Starting docker exec")
-	if err := client.StartExec(execObj.ID, startConfig); err != nil {
-		log.Printf("Error in docker exec: %s\n", err.Error())
-		return nil, err
-	}
+	// if err := client.StartExec(execObj.ID, startConfig); err != nil {
+	// 	log.Printf("Error in docker exec: %s\n", err.Error())
+	// }
+	go func() {
+		if err := client.StartExec(execObj.ID, startConfig); err != nil {
+			log.Printf("Error in docker exec: %s\n", err.Error())
+		}
+	}()
+	//<-success
+	log.Println("Docker exec started")
 	return execObj, nil
 }
